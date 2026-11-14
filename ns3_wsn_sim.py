@@ -174,9 +174,9 @@ def handle_watch(network, round_index):
     return
 
 def _make_optimizer(method: str, seed: int):
-    if method in ("moga","predictive"):
+    if method == "moga":
         return lambda network, rng: moga.optimize_cluster_heads(network, rng=rng)
-    if method == "graphsage":
+    if method in ("graphsage", "predictive"):
         from wsn_sim.graphsage_embed import make_embedder
 
         embedder = make_embedder(seed=seed)
