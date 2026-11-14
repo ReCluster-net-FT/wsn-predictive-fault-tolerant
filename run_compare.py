@@ -7,13 +7,14 @@ import tempfile
 import time
 
 N_NODES = 100
-ROUNDS = 3000
+ROUNDS = 30000
 SEEDS = [1, 2, 3, 4, 5]
 RESULTS_PATH = "multi_seed_wsn_dataset_results.json"
 SIMULATOR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ns3_wsn_sim.py")
 METHODS = (
     ("moga", "moga", "MOGA+TDMA"),
     ("graphsage", "moga_graphsage", "MOGA+GraphSAGE+TDMA"),
+    ("predictive", "moga_predictive", "MOGA+GraphSAGE+TDMA+XGBoost gate")
 )
 
 
