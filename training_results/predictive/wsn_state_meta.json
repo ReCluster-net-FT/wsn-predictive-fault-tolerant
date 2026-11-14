@@ -1,0 +1,312 @@
+{
+  "format_version": 2,
+  "variant": "D_metrics+embeddings+energy_tail",
+  "class_names": [
+    "healthy",
+    "watch",
+    "recluster"
+  ],
+  "feature_names": [
+    "emb_mean_0",
+    "emb_mean_1",
+    "emb_mean_2",
+    "emb_mean_3",
+    "emb_mean_4",
+    "emb_mean_5",
+    "emb_mean_6",
+    "emb_mean_7",
+    "emb_mean_8",
+    "emb_mean_9",
+    "emb_mean_10",
+    "emb_mean_11",
+    "emb_mean_12",
+    "emb_mean_13",
+    "emb_mean_14",
+    "emb_mean_15",
+    "emb_std_0",
+    "emb_std_1",
+    "emb_std_2",
+    "emb_std_3",
+    "emb_std_4",
+    "emb_std_5",
+    "emb_std_6",
+    "emb_std_7",
+    "emb_std_8",
+    "emb_std_9",
+    "emb_std_10",
+    "emb_std_11",
+    "emb_std_12",
+    "emb_std_13",
+    "emb_std_14",
+    "emb_std_15",
+    "emb_min_0",
+    "emb_min_1",
+    "emb_min_2",
+    "emb_min_3",
+    "emb_min_4",
+    "emb_min_5",
+    "emb_min_6",
+    "emb_min_7",
+    "emb_min_8",
+    "emb_min_9",
+    "emb_min_10",
+    "emb_min_11",
+    "emb_min_12",
+    "emb_min_13",
+    "emb_min_14",
+    "emb_min_15",
+    "emb_max_0",
+    "emb_max_1",
+    "emb_max_2",
+    "emb_max_3",
+    "emb_max_4",
+    "emb_max_5",
+    "emb_max_6",
+    "emb_max_7",
+    "emb_max_8",
+    "emb_max_9",
+    "emb_max_10",
+    "emb_max_11",
+    "emb_max_12",
+    "emb_max_13",
+    "emb_max_14",
+    "emb_max_15",
+    "avg_residual_energy",
+    "energy_consumption_rate",
+    "alive_node_ratio",
+    "avg_ch_residual_energy",
+    "min_ch_residual_energy",
+    "pdr",
+    "tail_min_energy",
+    "tail_low5_mean_energy",
+    "tail_frac_below_20pct",
+    "tail_frac_below_40pct"
+  ],
+  "metric_names": [
+    "avg_residual_energy",
+    "energy_consumption_rate",
+    "alive_node_ratio",
+    "avg_ch_residual_energy",
+    "min_ch_residual_energy",
+    "pdr"
+  ],
+  "emb_names": [
+    "emb_mean_0",
+    "emb_mean_1",
+    "emb_mean_2",
+    "emb_mean_3",
+    "emb_mean_4",
+    "emb_mean_5",
+    "emb_mean_6",
+    "emb_mean_7",
+    "emb_mean_8",
+    "emb_mean_9",
+    "emb_mean_10",
+    "emb_mean_11",
+    "emb_mean_12",
+    "emb_mean_13",
+    "emb_mean_14",
+    "emb_mean_15",
+    "emb_std_0",
+    "emb_std_1",
+    "emb_std_2",
+    "emb_std_3",
+    "emb_std_4",
+    "emb_std_5",
+    "emb_std_6",
+    "emb_std_7",
+    "emb_std_8",
+    "emb_std_9",
+    "emb_std_10",
+    "emb_std_11",
+    "emb_std_12",
+    "emb_std_13",
+    "emb_std_14",
+    "emb_std_15",
+    "emb_min_0",
+    "emb_min_1",
+    "emb_min_2",
+    "emb_min_3",
+    "emb_min_4",
+    "emb_min_5",
+    "emb_min_6",
+    "emb_min_7",
+    "emb_min_8",
+    "emb_min_9",
+    "emb_min_10",
+    "emb_min_11",
+    "emb_min_12",
+    "emb_min_13",
+    "emb_min_14",
+    "emb_min_15",
+    "emb_max_0",
+    "emb_max_1",
+    "emb_max_2",
+    "emb_max_3",
+    "emb_max_4",
+    "emb_max_5",
+    "emb_max_6",
+    "emb_max_7",
+    "emb_max_8",
+    "emb_max_9",
+    "emb_max_10",
+    "emb_max_11",
+    "emb_max_12",
+    "emb_max_13",
+    "emb_max_14",
+    "emb_max_15"
+  ],
+  "tail_names": [
+    "tail_min_energy",
+    "tail_low5_mean_energy",
+    "tail_frac_below_20pct",
+    "tail_frac_below_40pct"
+  ],
+  "uses_embeddings": true,
+  "uses_energy_tail": true,
+  "embed_dim": 16,
+  "pooling": [
+    "mean",
+    "std_ddof0",
+    "min",
+    "max"
+  ],
+  "energy_tail": {
+    "init_energy": 0.5,
+    "low_k": 5,
+    "fractions_of_init": [
+      0.2,
+      0.4
+    ]
+  },
+  "label_rules": {
+    "recluster_if_death_within": 15,
+    "watch_if_death_within": 50
+  },
+  "split": {
+    "dev_seeds": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "test_seed": 5
+  },
+  "graphsage_checkpoint_sha256": "112939ff3bd5d9db495f19aa9816f899f6c667f51f2197090b2e45ff42283822",
+  "xgboost_version": "3.4.1",
+  "results": {
+    "A_metrics_only": {
+      "cv_macro_f1_mean": 0.41668372924788427,
+      "cv_macro_f1_std": 0.03967902582638691,
+      "test_macro_f1": 0.4353950194555123,
+      "test_recall": {
+        "healthy": 0.5903036760788493,
+        "watch": 0.4583333333333333,
+        "recluster": 0.315
+      },
+      "test_confusion_matrix": [
+        [
+          1108,
+          465,
+          304
+        ],
+        [
+          129,
+          308,
+          235
+        ],
+        [
+          73,
+          201,
+          126
+        ]
+      ],
+      "n_estimators": 53
+    },
+    "B_metrics+energy_tail": {
+      "cv_macro_f1_mean": 0.8937590790827944,
+      "cv_macro_f1_std": 0.022224818580110658,
+      "test_macro_f1": 0.897250345118963,
+      "test_recall": {
+        "healthy": 0.9190197123068726,
+        "watch": 0.8869047619047619,
+        "recluster": 0.9375
+      },
+      "test_confusion_matrix": [
+        [
+          1725,
+          152,
+          0
+        ],
+        [
+          34,
+          596,
+          42
+        ],
+        [
+          0,
+          25,
+          375
+        ]
+      ],
+      "n_estimators": 137
+    },
+    "C_metrics+embeddings": {
+      "cv_macro_f1_mean": 0.362043085494764,
+      "cv_macro_f1_std": 0.04351953380771607,
+      "test_macro_f1": 0.25928995717640557,
+      "test_recall": {
+        "healthy": 1.0,
+        "watch": 0.0,
+        "recluster": 0.0
+      },
+      "test_confusion_matrix": [
+        [
+          1877,
+          0,
+          0
+        ],
+        [
+          672,
+          0,
+          0
+        ],
+        [
+          400,
+          0,
+          0
+        ]
+      ],
+      "n_estimators": 122
+    },
+    "D_metrics+embeddings+energy_tail": {
+      "cv_macro_f1_mean": 0.8581682077589052,
+      "cv_macro_f1_std": 0.012727828963928493,
+      "test_macro_f1": 0.8852248924383449,
+      "test_recall": {
+        "healthy": 0.9275439531166756,
+        "watch": 0.8273809523809523,
+        "recluster": 0.98
+      },
+      "test_confusion_matrix": [
+        [
+          1741,
+          136,
+          0
+        ],
+        [
+          27,
+          556,
+          89
+        ],
+        [
+          0,
+          8,
+          392
+        ]
+      ],
+      "n_estimators": 174
+    }
+  },
+  "majority_baseline_test_macro_f1": 0.25928995717640557
+}
