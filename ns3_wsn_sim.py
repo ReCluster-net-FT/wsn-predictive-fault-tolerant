@@ -169,9 +169,12 @@ def _slot_duration(payload_size: int) -> float:
     frames = max(1, math.ceil(payload_size / 1400))
     return _frame_airtime(payload_size) + frames * TDMA_GUARD_S
 
+def handle_watch(network, round_index):
+    """Placeholder for the 'watch' action. Not implemented yet."""
+    return
 
 def _make_optimizer(method: str, seed: int):
-    if method == "moga":
+    if method in ("moga","predictive"):
         return lambda network, rng: moga.optimize_cluster_heads(network, rng=rng)
     if method == "graphsage":
         from wsn_sim.graphsage_embed import make_embedder
@@ -229,6 +232,15 @@ def run_lifetime(
     
     optimizer = _make_optimizer(method, seed)
     rng = np.random.default_rng(seed)
+    
+    predictor = None
+    embedder = None
+    recluster_count = 0
+    if method == "predictive":
+        from wsn_sim import predictive_model
+        from wsn_sim.graphsage_embed import make_embedder
+        predictor = predictive_model.load_predictor()
+        embedder = make_embedder(seed=seed)
 
     mark("setup start")
     nodes = keep(ns.NodeContainer())
@@ -379,6 +391,8 @@ def run_lifetime(
         "round_time_s": [],
         "pareto_front_size": [],
         "mutation_rate": [],
+        "predicted_state": [],
+        "reclustered": [],
     }
     initial_alive = network.n_nodes
     first_death_round = -1
@@ -403,6 +417,10 @@ def run_lifetime(
                 if snapshot_dir is not None
                 else None
             )
+
+            if predictor is not None:
+                pre_round_embeddings = embedder(network)
+                pre_round_energy = network.energy[alive_idx].copy()
 
             chs = np.asarray(optimization.selected, dtype=int)
             chs = chs[np.isin(chs, alive_idx)]
@@ -576,7 +594,30 @@ def run_lifetime(
                 )
 
             if round_index + 1 < rounds and alive_now:
-                optimization = optimizer(network, rng)
+                if predictor is None:
+                    optimization = optimizer(network, rng)
+                else:
+                    state, probabilities = predictive_model.predict_state(
+                        embeddings=pre_round_embeddings,
+                        pre_round_energy=pre_round_energy,
+                        metrics={
+                            "avg_residual_energy": avg_live_residual_energy,
+                            "energy_consumption_rate": float(ch_energy_rate.mean()),
+                            "alive_node_ratio": alive_now / initial_alive,
+                            "avg_ch_residual_energy": float(ch_energy_after.mean()),
+                            "min_ch_residual_energy": float(ch_energy_after.min()),
+                            "pdr": pdr,
+                        },
+                    )
+                    ch_died = bool(np.any(ch_energy_after <= 0))
+                    do_recluster = state == "recluster" or ch_died
+                    history["predicted_state"].append(state)
+                    history["reclustered"].append(do_recluster)
+                    if do_recluster:
+                        optimization = optimizer(network, rng)
+                        recluster_count += 1
+                    elif state == "watch":
+                        handle_watch(network, round_index)
 
         print(flush=True)
     finally:
@@ -595,6 +636,7 @@ def run_lifetime(
             history["mutation_rate"][-1] if history["mutation_rate"] else None
         ),
         "first_death_round": first_death_round,
+        "recluster_count": recluster_count,
         "wall_time_s": time.time() - start_time,
         "trajectory": history,
         "final_pareto_front": (
@@ -609,7 +651,7 @@ def main() -> None:
     parser.add_argument("--dataset-csv", default=wsn_dataset.DEFAULT_CSV)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=3000)
-    parser.add_argument("--method", choices=("moga", "graphsage"), default="moga")
+    parser.add_argument("--method", choices=("moga", "graphsage", "predictive"), default="moga")
     parser.add_argument("--output", required=True)
     # Optional: when supplied, save one graph snapshot per simulated round.
     parser.add_argument("--snapshot-dir", default=None)
