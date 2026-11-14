@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local configuration and dataset
+.env
+.env.*
+!.env.example
+WSN_Dataset.csv
+
+# Generated simulation and training outputs
+multi_seed_wsn_dataset_results.json
+graphsage_training_data/
+training_results/
+seed_1_results.png
+
+# OS files
+.DS_Store
+Thumbs.db

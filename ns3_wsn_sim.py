@@ -108,6 +108,10 @@ SINK_ENERGY_J = 1e4
 UDP_PORT = 9000
 WIFI_DATA_RATE_BPS = 11_000_000
 TDMA_GUARD_S = 0.002
+RADIO_VOLTAGE_V = 3.0
+TX_CURRENT_A = 0.0174
+RX_CURRENT_A = 0.0197
+IDLE_CURRENT_A = 1e-6
 
 
 def _distance_matrix_with_sink(network) -> np.ndarray:
@@ -116,14 +120,12 @@ def _distance_matrix_with_sink(network) -> np.ndarray:
     return np.linalg.norm(differences, axis=-1)
 
 
-def save_graph_snapshot(network, alive_idx, seed, round_index, snapshot_dir):
-    """Save the alive-node graph and features for one simulation round."""
-    os.makedirs(snapshot_dir, exist_ok=True)
-
+def build_graph_snapshot(network, alive_idx, seed, round_index):
+    """Capture the pre-round graph state for one simulation round."""
     # Keep original node IDs so nodes can be identified across snapshots.
-    positions = network.pos[alive_idx]
-    residual_energy = network.energy[alive_idx]
-    node_features = network.node_features[alive_idx]
+    positions = network.pos[alive_idx].copy()
+    residual_energy = network.energy[alive_idx].copy()
+    node_features = network.node_features[alive_idx].copy()
 
     # Build the graph over alive nodes using the same range as the simulator.
     all_sensor_distances = network.dist_matrix()
@@ -134,30 +136,38 @@ def save_graph_snapshot(network, alive_idx, seed, round_index, snapshot_dir):
     # PyTorch Geometric-style edge list: row 0 = source, row 1 = destination.
     edge_index = np.asarray(np.where(adjacency == 1), dtype=np.int64)
 
-    # One file per round avoids mixing graphs with different node counts.
+    return {
+        "seed": np.asarray(seed),
+        "round_index": np.asarray(round_index),
+        "node_ids": alive_idx.copy(),
+        "positions": positions,
+        "residual_energy": residual_energy,
+        "node_features": node_features,
+        "adjacency": adjacency,
+        "edge_index": edge_index,
+    }
+
+
+def save_graph_snapshot(snapshot_data, metrics, snapshot_dir):
+    """Save pre-round graph data and the completed round's metrics."""
+    os.makedirs(snapshot_dir, exist_ok=True)
+    seed = int(snapshot_data["seed"])
+    round_index = int(snapshot_data["round_index"])
     file_path = os.path.join(
         snapshot_dir,
         f"seed_{seed}_round_{round_index:05d}.npz"
     )
-    np.savez_compressed(
-        file_path,
-        seed=np.asarray(seed),
-        round_index=np.asarray(round_index),
-        node_ids=alive_idx,
-        positions=positions,
-        residual_energy=residual_energy,
-        node_features=node_features,
-        adjacency=adjacency,
-        edge_index=edge_index,
-    )
+    np.savez_compressed(file_path, **snapshot_data, **metrics)
+
+
+def _frame_airtime(payload_size: int) -> float:
+    frames = max(1, math.ceil(payload_size / 1400))
+    return (payload_size + frames * 256) * 8 / WIFI_DATA_RATE_BPS
 
 
 def _slot_duration(payload_size: int) -> float:
     frames = max(1, math.ceil(payload_size / 1400))
-    return (
-        (payload_size + frames * 256) * 8 / WIFI_DATA_RATE_BPS
-        + frames * TDMA_GUARD_S
-    )
+    return _frame_airtime(payload_size) + frames * TDMA_GUARD_S
 
 
 def _make_optimizer(method: str, seed: int):
@@ -210,6 +220,7 @@ def run_lifetime(
 
     # Calculate pairwise distances between sensor nodes
     sensor_distances = network.dist_matrix()
+    radio_distances = _distance_matrix_with_sink(network)
 
     # Calculate node degrees using the same communication range
     node_degrees = (
@@ -269,23 +280,6 @@ def run_lifetime(
         for i in range(network.n_nodes + 1)
     ]
 
-    energy_sources = []
-    radio_models = []
-    for node_id in range(network.n_nodes + 1):
-        source_helper = keep(ns.BasicEnergySourceHelper())
-        initial_energy = (float(network.energy[node_id])
-                          if node_id < network.n_nodes else SINK_ENERGY_J)
-        source_helper.Set("BasicEnergySourceInitialEnergyJ", keep(ns.DoubleValue(initial_energy)))
-        source = keep(source_helper.Install(node_ptrs[node_id]))
-        energy_sources.append(keep(source.Get(0)))
-
-        radio_helper = keep(ns.WifiRadioEnergyModelHelper())
-        radio_helper.Set("IdleCurrentA", keep(ns.DoubleValue(1e-6)))
-        radio_helper.Set("CcaBusyCurrentA", keep(ns.DoubleValue(1e-6)))
-        device_container = keep(ns.NetDeviceContainer(keep(devices.Get(node_id))))
-        radio_models.append(keep(radio_helper.Install(device_container, source)))
-    mark("energy models installed")
-
     receive_sockets = []
     transmit_senders = []
     any_address = keep(ns.Ipv4Address.GetAny())
@@ -302,19 +296,69 @@ def run_lifetime(
         transmit_senders.append(keep(sender))
     mark("sockets and senders created")
 
+    sink_energy = SINK_ENERGY_J
+    round_tx_airtime = np.zeros(network.n_nodes + 1, dtype=np.float64)
+    round_rx_airtime = np.zeros(network.n_nodes + 1, dtype=np.float64)
+    round_live_mask = np.zeros(network.n_nodes + 1, dtype=bool)
+
     def remaining_energy(node_id: int) -> float:
-        return float(energy_sources[node_id].GetRemainingEnergy())
+        if node_id == network.n_nodes:
+            return float(sink_energy)
+        return float(network.energy[node_id])
 
-    def update_network_energy() -> None:
-        network.energy[:] = [remaining_energy(i) for i in range(network.n_nodes)]
-        network.alive[:] = network.energy > 0
-
-    def schedule_packet(src: int, dst: int, payload_factory, offset: float) -> None:
+    def schedule_packet(
+        src: int,
+        dst: int,
+        payload_factory,
+        offset: float,
+        size_overhead: int,
+    ) -> int:
         payload = payload_factory()
         payload_text = payload.decode("utf-8")
+        packet_size = len(payload) + size_overhead
+        airtime = _frame_airtime(packet_size)
+
+        round_tx_airtime[src] += airtime
+        in_range = np.flatnonzero(
+            radio_distances[src] <= communication_range
+        )
+        for receiver in in_range:
+            if receiver != src and round_live_mask[receiver]:
+                round_rx_airtime[receiver] += airtime
+
         transmit_senders[src].ScheduleSend(
             keep(ns.Seconds(offset)), dest_addresses[dst], payload_text
         )
+        return len(payload)
+
+    def debit_round_energy(round_duration: float) -> None:
+        nonlocal sink_energy
+
+        tx_power = TX_CURRENT_A * RADIO_VOLTAGE_V
+        rx_power = RX_CURRENT_A * RADIO_VOLTAGE_V
+        idle_power = IDLE_CURRENT_A * RADIO_VOLTAGE_V
+        active_time = round_tx_airtime + round_rx_airtime
+        if np.any(active_time > round_duration + 1e-9):
+            raise RuntimeError(
+                "Per-node radio airtime exceeds the TDMA round duration."
+            )
+
+        energy_used = (
+            round_duration * idle_power
+            + round_tx_airtime * (tx_power - idle_power)
+            + round_rx_airtime * (rx_power - idle_power)
+        )
+        live_sensors = round_live_mask[:network.n_nodes]
+        network.energy[live_sensors] = np.maximum(
+            0.0,
+            network.energy[live_sensors] - energy_used[:network.n_nodes][live_sensors],
+        )
+        if round_live_mask[network.n_nodes]:
+            sink_energy = max(
+                0.0,
+                sink_energy - float(energy_used[network.n_nodes]),
+            )
+        network.alive[:] = network.energy > 0
 
     def drain_packets() -> list[int]:
         received = []
@@ -345,23 +389,27 @@ def run_lifetime(
 
     try:
         for round_index in range(rounds):
-            update_network_energy()
+            network.alive[:] = network.energy > 0
             alive_idx = network.alive_idx()
             if len(alive_idx) == 0:
                 break
+            round_tx_airtime.fill(0.0)
+            round_rx_airtime.fill(0.0)
+            round_live_mask[:network.n_nodes] = network.alive
+            round_live_mask[network.n_nodes] = True
 
-            # Save this round's graph after updating energy and identifying alive nodes,
-            # but before clustering and packet transmission change the network state.
-            if snapshot_dir is not None:
-                save_graph_snapshot(
-                    network, alive_idx, seed, round_index, snapshot_dir
-                )
+            snapshot_data = (
+                build_graph_snapshot(network, alive_idx, seed, round_index)
+                if snapshot_dir is not None
+                else None
+            )
 
             chs = np.asarray(optimization.selected, dtype=int)
             chs = chs[np.isin(chs, alive_idx)]
             if len(chs) == 0:
                 optimization = optimizer(network, rng)
                 chs = np.asarray(optimization.selected, dtype=int)
+            ch_energy_before = network.energy[chs].copy()
             ch_set = set(int(ch) for ch in chs)
             members = np.setdiff1d(alive_idx, chs)
 
@@ -398,10 +446,10 @@ def run_lifetime(
                             record, separators=(",", ":"), allow_nan=False
                         ).encode("utf-8")
 
-                    schedule_packet(
-                        member, ch, member_payload, slot_offset
+                    payload_size = schedule_packet(
+                        member, ch, member_payload, slot_offset, 32
                     )
-                    slot_offset += _slot_duration(len(member_payload()) + 32)
+                    slot_offset += _slot_duration(payload_size + 32)
 
             expected_ch_packets = 0
             for ch in sorted(ch_set):
@@ -426,14 +474,12 @@ def run_lifetime(
                         allow_nan=False,
                     ).encode("utf-8")
 
-                schedule_packet(
-                    ch,
-                    network.n_nodes,
-                    aggregate_payload,
-                    slot_offset,
+                payload_size = schedule_packet(
+                    ch, network.n_nodes, aggregate_payload, slot_offset,
+                    len(cluster_nodes) * 16,
                 )
                 slot_offset += _slot_duration(
-                    len(aggregate_payload()) + len(cluster_nodes) * 16
+                    payload_size + len(cluster_nodes) * 16
                 )
 
             round_duration = max(slot_offset, 0.01)
@@ -453,13 +499,14 @@ def run_lifetime(
             expected_packets = expected_member_packets + expected_ch_packets
             history["member_packets_delivered"].append(member_delivered)
             history["ch_packets_delivered"].append(ch_delivered)
-            history["delivery_rate"].append(
+            pdr = (
                 (member_delivered + ch_delivered) / expected_packets
                 if expected_packets else 1.0
             )
+            history["delivery_rate"].append(pdr)
             history["round_time_s"].append(round_duration)
 
-            update_network_energy()
+            debit_round_energy(round_duration)
             print(f"r{round_index} t={keep(ns.Simulator.Now()).GetSeconds():.3f}s "
                   f"sink={remaining_energy(network.n_nodes):.6f} "
                   f"n0={remaining_energy(0):.6f} n1={remaining_energy(1):.6f}", flush=True)
@@ -467,9 +514,48 @@ def run_lifetime(
             alive_now = int(network.alive.sum())
             history["alive"].append(alive_now)
             live_energy = network.energy[network.alive]
-            history["avg_residual"].append(
+            avg_live_residual_energy = (
                 float(live_energy.mean()) if len(live_energy) else 0.0
             )
+            avg_residual_energy = float(network.energy.mean())
+            history["avg_residual"].append(avg_live_residual_energy)
+
+            ch_energy_after = network.energy[chs]
+            ch_energy_consumed = np.maximum(
+                ch_energy_before - ch_energy_after, 0.0
+            )
+            ch_energy_rate = ch_energy_consumed / round_duration
+            if snapshot_data is not None:
+                save_graph_snapshot(
+                    snapshot_data,
+                    {
+                        "cluster_head_ids": chs.astype(np.int64),
+                        "avg_residual_energy_j": np.asarray(
+                            avg_residual_energy
+                        ),
+                        "avg_live_residual_energy_j": np.asarray(
+                            avg_live_residual_energy
+                        ),
+                        "avg_ch_energy_consumption_rate_w": np.asarray(
+                            float(ch_energy_rate.mean())
+                        ),
+                        "cluster_head_energy_consumption_rate_w": (
+                            ch_energy_rate
+                        ),
+                        "alive_node_ratio": np.asarray(
+                            alive_now / initial_alive
+                        ),
+                        "avg_ch_residual_energy_j": np.asarray(
+                            float(ch_energy_after.mean())
+                        ),
+                        "min_ch_residual_energy_j": np.asarray(
+                            float(ch_energy_after.min())
+                        ),
+                        "pdr": np.asarray(pdr),
+                    },
+                    snapshot_dir,
+                )
+
             history["pareto_front_size"].append(len(optimization.front))
             history["mutation_rate"].append(optimization.final_mutation_rate)
             final_optimization = optimization
