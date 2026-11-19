@@ -145,51 +145,35 @@ def parse_args():
         nargs="*",
         help=(
             "Result JSON file(s) or directory/directories. Directories are "
-            "searched for seed_*.json files. With no inputs, the "
-            "training_results and graphsage_training_data directories are "
-            "plotted separately."
+            "searched for seed_*.json files."
         ),
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=script_dir / "training_results" / "simulation_results.png",
-        help=(
-            "Output path for the training_results dashboard. The second "
-            "default dashboard uses the same path with "
-            "'_graphsage_training_data' added to its filename."
-        ),
+        help="Output path for the trajectory dashboard PNG.",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    script_dir = Path(__file__).resolve().parent
-    if args.inputs:
-        plot_groups = [(args.inputs, args.output)]
-    else:
-        graphsage_output = args.output.with_name(
-            f"{args.output.stem}_graphsage_training_data{args.output.suffix}"
-        )
-        plot_groups = [
-            ([str(script_dir / "training_results")], args.output),
-            ([str(script_dir / "graphsage_training_data")], graphsage_output),
-        ]
+    inputs = args.inputs or [str(Path(__file__).resolve().parent /
+                                 "graphsage_training_data")]
+    results = load_results(collect_result_files(inputs))
 
-    for inputs, output in plot_groups:
-        results = load_results(collect_result_files(inputs))
-        output_path = output.resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        pareto_path = output_path.with_name(
-            f"{output_path.stem}_pareto{output_path.suffix}"
-        )
+    output_path = args.output.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pareto_path = output_path.with_name(
+        f"{output_path.stem}_pareto{output_path.suffix}"
+    )
 
-        plot_trajectories(results, output_path)
-        plot_pareto_selection(results, pareto_path)
-        print_summaries(results)
-        print(f"\nTrajectory dashboard: {output_path}")
-        print(f"Pareto selection plot: {pareto_path}")
+    plot_trajectories(results, output_path)
+    plot_pareto_selection(results, pareto_path)
+    print_summaries(results)
+    print(f"\nTrajectory dashboard: {output_path}")
+    print(f"Pareto selection plot: {pareto_path}")
 
 
 if __name__ == "__main__":

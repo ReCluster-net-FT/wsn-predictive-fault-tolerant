@@ -65,6 +65,8 @@ ns.cppyy.cppdef("""
         explicit ScheduledUdpSender(Ptr<Node> node)
             : m_socket(Socket::CreateSocket(node, UdpSocketFactory::GetTypeId()))
         {
+            // Schedule broadcasts (BS) and cluster beacons (CHs) are broadcasts.
+            m_socket->SetAllowBroadcast(true);
         }
 
         void ScheduleSend(Time delay, Address destination, std::string payload)
@@ -106,6 +108,7 @@ ns.cppyy.cppdef("""
 
 SINK_ENERGY_J = 1e4
 UDP_PORT = 9000
+CTRL_PORT = 9001  # control traffic: BS schedule broadcast and CH beacons
 WIFI_DATA_RATE_BPS = 11_000_000
 TDMA_GUARD_S = 0.002
 RADIO_VOLTAGE_V = 3.0
@@ -218,12 +221,15 @@ def run_lifetime(
         raise ValueError("the WSN dataset contains non-finite sensor features")
     if not np.isfinite(network.energy).all() or np.any(network.energy <= 0):
         raise ValueError("the WSN dataset must provide positive finite initial energy")
-    # Use the same communication range as GraphSAGE
+    # Neighbour range used for the GraphSAGE graph and the node degree.
     communication_range = network.communication_range
 
     # Calculate pairwise distances between sensor nodes
     sensor_distances = network.dist_matrix()
     radio_distances = _distance_matrix_with_sink(network)
+    # Dense deployment: the radio reaches every sensor, every possible CH and
+    # the BS, so a member can always fall back to sending directly to the BS.
+    radio_range = float(radio_distances.max()) + 1.0
 
     # Calculate node degrees using the same communication range
     node_degrees = (
@@ -270,7 +276,7 @@ def run_lifetime(
     channel.AddPropagationLoss(
         "ns3::RangePropagationLossModel",
         "MaxRange",
-        keep(ns.DoubleValue(communication_range)),
+        keep(ns.DoubleValue(radio_range)),
     )
     phy.SetChannel(keep(channel.Create()))
     mac = keep(ns.WifiMacHelper())
@@ -283,6 +289,9 @@ def run_lifetime(
     address = keep(ns.Ipv4AddressHelper())
     address.SetBase(keep(ns.Ipv4Address("10.1.0.0")), keep(ns.Ipv4Mask("255.255.0.0")))
     interfaces = keep(address.Assign(devices))
+    # Static network with a BS-assigned schedule: neighbour tables are known
+    # up front, so no ARP exchanges spill into other nodes' TDMA slots.
+    keep(ns.NeighborCacheHelper()).PopulateNeighborCache()
     mark("internet stack installed")
 
     # Fetch node / device / address handles once and reuse them.
@@ -292,113 +301,159 @@ def run_lifetime(
         for i in range(network.n_nodes + 1)
     ]
 
+    broadcast_address = keep(keep(ns.InetSocketAddress(
+        keep(ns.Ipv4Address("10.1.255.255")), CTRL_PORT)).ConvertTo())
+    # The BS identifies the sender of each data packet by its IPv4 address.
+    node_by_ip = {
+        interfaces.GetAddress(i).Get(): i for i in range(network.n_nodes + 1)
+    }
+
     receive_sockets = []
+    control_sockets = []
     transmit_senders = []
     any_address = keep(ns.Ipv4Address.GetAny())
     local_address = keep(keep(ns.InetSocketAddress(any_address, UDP_PORT)).ConvertTo())
+    control_address = keep(keep(ns.InetSocketAddress(any_address, CTRL_PORT)).ConvertTo())
     udp_tid = keep(ns.UdpSocketFactory.GetTypeId())
     for node_id in range(network.n_nodes + 1):
         receiver = keep(ns.Socket.CreateSocket(node_ptrs[node_id], udp_tid))
         if receiver.Bind(local_address) < 0:
             raise RuntimeError(f"could not bind receiver socket on node {node_id}")
         receive_sockets.append(receiver)
+        control = keep(ns.Socket.CreateSocket(node_ptrs[node_id], udp_tid))
+        if control.Bind(control_address) < 0:
+            raise RuntimeError(f"could not bind control socket on node {node_id}")
+        control_sockets.append(control)
 
         sender = ns.cppyy.gbl.MakeScheduledUdpSender(node_ptrs[node_id])
         sender.__python_owns__ = False  # C++ owns it; Python must never delete it
         transmit_senders.append(keep(sender))
     mark("sockets and senders created")
 
+    sink = network.n_nodes
     sink_energy = SINK_ENERGY_J
-    round_tx_airtime = np.zeros(network.n_nodes + 1, dtype=np.float64)
-    round_rx_airtime = np.zeros(network.n_nodes + 1, dtype=np.float64)
-    round_live_mask = np.zeros(network.n_nodes + 1, dtype=bool)
+    tx_power = TX_CURRENT_A * RADIO_VOLTAGE_V
+    rx_power = RX_CURRENT_A * RADIO_VOLTAGE_V
+    idle_power = IDLE_CURRENT_A * RADIO_VOLTAGE_V
 
     def remaining_energy(node_id: int) -> float:
-        if node_id == network.n_nodes:
+        if node_id == sink:
             return float(sink_energy)
         return float(network.energy[node_id])
 
-    def schedule_packet(
-        src: int,
-        dst: int,
-        payload_factory,
-        offset: float,
-        size_overhead: int,
-    ) -> int:
-        payload = payload_factory()
-        payload_text = payload.decode("utf-8")
-        packet_size = len(payload) + size_overhead
-        airtime = _frame_airtime(packet_size)
-
-        round_tx_airtime[src] += airtime
-        in_range = np.flatnonzero(
-            radio_distances[src] <= communication_range
-        )
-        for receiver in in_range:
-            if receiver != src and round_live_mask[receiver]:
-                round_rx_airtime[receiver] += airtime
-
-        transmit_senders[src].ScheduleSend(
-            keep(ns.Seconds(offset)), dest_addresses[dst], payload_text
-        )
-        return len(payload)
-
-    def debit_round_energy(round_duration: float) -> None:
+    def spend(node_id: int, airtime: float, power: float) -> bool:
+        """Debit one TDMA slot of radio energy. A node that cannot afford the
+        slot dies at that moment, so the slot's transmit/receive fails."""
         nonlocal sink_energy
+        cost = airtime * (power - idle_power)
+        if node_id == sink:
+            sink_energy = max(0.0, sink_energy - cost)
+            return True
+        if not network.alive[node_id]:
+            return False
+        if network.energy[node_id] < cost:
+            network.energy[node_id] = 0.0
+            network.alive[node_id] = False
+            return False
+        network.energy[node_id] -= cost
+        return True
 
-        tx_power = TX_CURRENT_A * RADIO_VOLTAGE_V
-        rx_power = RX_CURRENT_A * RADIO_VOLTAGE_V
-        idle_power = IDLE_CURRENT_A * RADIO_VOLTAGE_V
-        active_time = round_tx_airtime + round_rx_airtime
-        if np.any(active_time > round_duration + 1e-9):
-            raise RuntimeError(
-                "Per-node radio airtime exceeds the TDMA round duration."
+    def send_slot(src: int, dst: int | None, payload: bytes, offset: float,
+                  overhead: int, listeners) -> tuple[float, bool, list[int]]:
+        """One TDMA slot: `src` transmits, only the scheduled `listeners` wake
+        up to receive (every other node sleeps). dst=None is a broadcast.
+
+        Returns (slot duration, whether src transmitted, listeners that heard
+        it). The slot is reserved in the schedule even if src is dead.
+        """
+        size = len(payload) + overhead
+        airtime = _frame_airtime(size)
+        duration = _slot_duration(size)
+        if not spend(src, airtime, tx_power):
+            return duration, False, []
+        heard = [int(n) for n in listeners if spend(int(n), airtime, rx_power)]
+        if dst is None or heard:
+            transmit_senders[src].ScheduleSend(
+                keep(ns.Seconds(offset)),
+                broadcast_address if dst is None else dest_addresses[dst],
+                payload.decode("utf-8"),
             )
+        return duration, True, heard
 
-        energy_used = (
-            round_duration * idle_power
-            + round_tx_airtime * (tx_power - idle_power)
-            + round_rx_airtime * (rx_power - idle_power)
+    def record_payload(node_id: int) -> bytes:
+        # Residual energy is piggybacked on the regular sensor data.
+        record = _sensor_record(
+            network, node_id, int(node_degrees[node_id]),
+            temperature_index, humidity_index, remaining_energy(node_id),
         )
-        live_sensors = round_live_mask[:network.n_nodes]
-        network.energy[live_sensors] = np.maximum(
-            0.0,
-            network.energy[live_sensors] - energy_used[:network.n_nodes][live_sensors],
-        )
-        if round_live_mask[network.n_nodes]:
-            sink_energy = max(
-                0.0,
-                sink_energy - float(energy_used[network.n_nodes]),
-            )
-        network.alive[:] = network.energy > 0
+        return json.dumps(record, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
-    def drain_packets() -> list[int]:
+    def build_schedule(selected) -> dict[int, list[int]]:
+        """BS-assigned two-level TDMA schedule: CH slot order (level 2) and,
+        per CH, its members' slot order (level 1). Kept until a re-cluster."""
+        chs = sorted(int(ch) for ch in selected)
+        members = np.setdiff1d(network.alive_idx(), chs)
+        assigned = {ch: [] for ch in chs}
+        if len(members) and chs:
+            if network.cost_matrix is not None:
+                distances = network.cost_matrix[np.ix_(members, chs)]
+            else:
+                distances = np.linalg.norm(
+                    network.pos[members][:, None, :] - network.pos[chs][None, :, :],
+                    axis=-1,
+                )
+            for member, choice in zip(members, distances.argmin(axis=1)):
+                assigned[chs[choice]].append(int(member))
+        return assigned
+
+    def drain_packets() -> tuple[list[int], int, int]:
+        """Per-node data-packet counts, plus the BS's split of what it got
+        from scheduled CHs vs. from non-CH nodes (direct member traffic)."""
         received = []
+        from_ch = from_non_ch = 0
         for node_id, receiver in enumerate(receive_sockets):
             count = 0
             while receiver.GetRxAvailable() > 0:
-                keep(receiver.Recv())
+                if node_id == sink:
+                    source = keep(ns.Address())
+                    keep(receiver.RecvFrom(source))
+                    sender_ip = ns.InetSocketAddress.ConvertFrom(source).GetIpv4().Get()
+                    if node_by_ip.get(sender_ip) in schedule:
+                        from_ch += 1
+                    else:
+                        from_non_ch += 1
+                else:
+                    keep(receiver.Recv())
                 count += 1
             received.append(count)
-        return received
+        for control in control_sockets:
+            while control.GetRxAvailable() > 0:
+                keep(control.Recv())
+        return received, from_ch, from_non_ch
 
     history = {
         "alive": [],
         "avg_residual": [],
         "member_packets_delivered": [],
         "ch_packets_delivered": [],
+        "direct_to_bs_packets": [],
+        "orphaned_members": [],
         "delivery_rate": [],
         "round_time_s": [],
         "pareto_front_size": [],
         "mutation_rate": [],
         "predicted_state": [],
         "reclustered": [],
+        "recluster_reason": [],
     }
+    recluster_reasons: dict[str, int] = {}
     initial_alive = network.n_nodes
     first_death_round = -1
     final_optimization = None
     start_time = time.time()
     optimization = optimizer(network, rng)
+    schedule = build_schedule(optimization.selected)
+    schedule_pending = True  # BS must broadcast the new schedule
     mark("setup done")
 
     try:
@@ -407,10 +462,6 @@ def run_lifetime(
             alive_idx = network.alive_idx()
             if len(alive_idx) == 0:
                 break
-            round_tx_airtime.fill(0.0)
-            round_rx_airtime.fill(0.0)
-            round_live_mask[:network.n_nodes] = network.alive
-            round_live_mask[network.n_nodes] = True
 
             snapshot_data = (
                 build_graph_snapshot(network, alive_idx, seed, round_index)
@@ -422,85 +473,75 @@ def run_lifetime(
                 pre_round_embeddings = embedder(network)
                 pre_round_energy = network.energy[alive_idx].copy()
 
-            chs = np.asarray(optimization.selected, dtype=int)
-            chs = chs[np.isin(chs, alive_idx)]
-            if len(chs) == 0:
-                optimization = optimizer(network, rng)
-                chs = np.asarray(optimization.selected, dtype=int)
+            chs = np.asarray(list(schedule), dtype=int)
             ch_energy_before = network.energy[chs].copy()
-            ch_set = set(int(ch) for ch in chs)
-            members = np.setdiff1d(alive_idx, chs)
+            expected_ch_packets = int(network.alive[chs].sum())
+            offset = 0.0
 
-            if len(members):
-                if network.cost_matrix is not None:
-                    distances = network.cost_matrix[np.ix_(members, chs)]
-                else:
-                    distances = np.linalg.norm(
-                        network.pos[members][:, None, :] - network.pos[chs][None, :, :],
-                        axis=-1,
-                    )
-                assigned = {int(ch): [] for ch in chs}
-                for member, choice in zip(members, distances.argmin(axis=1)):
-                    assigned[int(chs[choice])].append(int(member))
-            else:
-                assigned = {int(ch): [] for ch in chs}
+            # Level 0 (only after a re-cluster): the BS broadcasts the schedule.
+            if schedule_pending:
+                payload = json.dumps(
+                    {"round": round_index,
+                     "schedule": {str(ch): members for ch, members in schedule.items()}},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                duration, _, _ = send_slot(sink, None, payload, offset, 32, alive_idx)
+                offset += duration
+                schedule_pending = False
 
-            slot_offset = 0.0
+            # Level 1: one frame per CH -- a beacon, then one slot per member.
+            # No beacon (CH dead) or no MAC ACK (CH died mid-frame) means the
+            # member is orphaned and falls back to the BS in the last frame.
             expected_member_packets = 0
-            for ch in sorted(ch_set):
-                for member in assigned[ch]:
-                    expected_member_packets += 1
-
-                    def member_payload(node_id=member):
-                        record = _sensor_record(
-                            network,
-                            node_id,
-                            int(node_degrees[node_id]),
-                            temperature_index,
-                            humidity_index,
-                            remaining_energy(node_id),
-                        )
-                        return json.dumps(
-                            record, separators=(",", ":"), allow_nan=False
-                        ).encode("utf-8")
-
-                    payload_size = schedule_packet(
-                        member, ch, member_payload, slot_offset, 32
+            delivered_to_ch = {ch: [] for ch in schedule}
+            orphaned = []
+            for ch, members in schedule.items():
+                live_members = [m for m in members if network.alive[m]]
+                expected_member_packets += len(live_members)
+                beacon = json.dumps({"ch": ch, "round": round_index}).encode("utf-8")
+                duration, _, heard = send_slot(ch, None, beacon, offset, 32, live_members)
+                offset += duration
+                heard = set(heard)
+                for member in live_members:
+                    if member not in heard:
+                        if network.alive[member]:
+                            orphaned.append(member)
+                        continue
+                    duration, sent, got = send_slot(
+                        member, ch, record_payload(member), offset, 32, [ch]
                     )
-                    slot_offset += _slot_duration(payload_size + 32)
+                    offset += duration
+                    if got:
+                        delivered_to_ch[ch].append(member)
+                    elif sent:
+                        orphaned.append(member)
 
-            expected_ch_packets = 0
-            for ch in sorted(ch_set):
-                expected_ch_packets += 1
-                cluster_nodes = [ch] + assigned[ch]
-
-                def aggregate_payload(ch_id=ch, node_ids=cluster_nodes):
-                    records = [
-                        _sensor_record(
-                            network,
-                            node_id,
-                            int(node_degrees[node_id]),
-                            temperature_index,
-                            humidity_index,
-                            remaining_energy(node_id),
-                        )
-                        for node_id in node_ids
-                    ]
-                    return json.dumps(
-                        {"cluster_head": ch_id, "round": round_index, "nodes": records},
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode("utf-8")
-
-                payload_size = schedule_packet(
-                    ch, network.n_nodes, aggregate_payload, slot_offset,
-                    len(cluster_nodes) * 16,
+            # Level 2: one slot per CH for its aggregate to the BS ...
+            for ch in schedule:
+                cluster_nodes = [ch] + delivered_to_ch[ch]
+                payload = json.dumps(
+                    {"cluster_head": ch, "round": round_index,
+                     "nodes": [json.loads(record_payload(n)) for n in cluster_nodes]},
+                    separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")
+                duration, _, _ = send_slot(
+                    ch, sink, payload, offset, len(cluster_nodes) * 16, [sink]
                 )
-                slot_offset += _slot_duration(
-                    payload_size + len(cluster_nodes) * 16
-                )
+                offset += duration
 
-            round_duration = max(slot_offset, 0.01)
+            # ... then the emergency slots: orphaned members send directly to the BS.
+            for member in orphaned:
+                duration, _, _ = send_slot(
+                    member, sink, record_payload(member), offset, 32, [sink]
+                )
+                offset += duration
+
+            round_duration = max(offset, 0.01)
+            live = network.alive.copy()
+            network.energy[live] = np.maximum(
+                0.0, network.energy[live] - round_duration * idle_power
+            )
+
             mark(f"round {round_index} before Run")
             ns.Simulator.Stop(keep(ns.Seconds(round_duration)))
             ns.Simulator.Run()
@@ -511,23 +552,26 @@ def run_lifetime(
             if send_failures:
                 raise RuntimeError(f"ns-3 reported {send_failures} UDP send failures")
 
-            received = drain_packets()
-            member_delivered = sum(received[ch] for ch in ch_set)
-            ch_delivered = received[network.n_nodes]
+            received, ch_delivered, direct_delivered = drain_packets()
+            member_delivered = sum(received[ch] for ch in schedule)
             expected_packets = expected_member_packets + expected_ch_packets
             history["member_packets_delivered"].append(member_delivered)
             history["ch_packets_delivered"].append(ch_delivered)
+            history["direct_to_bs_packets"].append(direct_delivered)
+            history["orphaned_members"].append(len(orphaned))
+            # Hop-level delivery: member data counts once, at its CH or (after
+            # a CH failure) directly at the BS.
             pdr = (
-                (member_delivered + ch_delivered) / expected_packets
+                (member_delivered + direct_delivered + ch_delivered) / expected_packets
                 if expected_packets else 1.0
             )
             history["delivery_rate"].append(pdr)
             history["round_time_s"].append(round_duration)
 
-            debit_round_energy(round_duration)
             print(f"r{round_index} t={keep(ns.Simulator.Now()).GetSeconds():.3f}s "
-                  f"sink={remaining_energy(network.n_nodes):.6f} "
+                  f"sink={remaining_energy(sink):.6f} "
                   f"n0={remaining_energy(0):.6f} n1={remaining_energy(1):.6f}", flush=True)
+            network.alive[:] = network.energy > 0
             network.kill_dead()
             alive_now = int(network.alive.sum())
             history["alive"].append(alive_now)
@@ -593,9 +637,15 @@ def run_lifetime(
                     flush=True,
                 )
 
+            # Re-cluster triggers, decided at the BS after the round.
+            reason = None
             if round_index + 1 < rounds and alive_now:
+                if direct_delivered:
+                    reason = "ch_failure"  # BS received data from a non-CH node
+                elif not network.alive[chs].any():
+                    reason = "no_live_ch"
                 if predictor is None:
-                    optimization = optimizer(network, rng)
+                    reason = reason or "periodic"  # baselines re-cluster every round
                 else:
                     state, probabilities = predictive_model.predict_state(
                         embeddings=pre_round_embeddings,
@@ -609,16 +659,19 @@ def run_lifetime(
                             "pdr": pdr,
                         },
                     )
-                    ch_died = bool(np.any(ch_energy_after <= 0))
-                    do_recluster = state == "recluster" or ch_died
                     history["predicted_state"].append(state)
-                    history["reclustered"].append(do_recluster)
-                    if do_recluster:
-                        optimization = optimizer(network, rng)
-                        recluster_count += 1
-                    elif state == "watch":
+                    if reason is None and state == "recluster":
+                        reason = "predicted"
+                    elif reason is None and state == "watch":
                         handle_watch(network, round_index)
-
+                if reason is not None:
+                    optimization = optimizer(network, rng)
+                    schedule = build_schedule(optimization.selected)
+                    schedule_pending = True
+                    recluster_count += 1
+                    recluster_reasons[reason] = recluster_reasons.get(reason, 0) + 1
+            history["reclustered"].append(reason is not None)
+            history["recluster_reason"].append(reason)
         print(flush=True)
     finally:
         pass  # skipped: Destroy() corrupts the heap under cppyy; process ends via os._exit
@@ -630,6 +683,7 @@ def run_lifetime(
         "rounds_completed": len(history["alive"]),
         "n_nodes": network.n_nodes,
         "communication_range": communication_range,
+        "radio_range": radio_range,
         "final_alive": history["alive"][-1] if history["alive"] else initial_alive,
         "final_avg_residual": history["avg_residual"][-1] if history["avg_residual"] else 0.0,
         "final_mutation_rate": (
@@ -637,6 +691,8 @@ def run_lifetime(
         ),
         "first_death_round": first_death_round,
         "recluster_count": recluster_count,
+        "recluster_reasons": recluster_reasons,
+        "direct_to_bs_packets": int(sum(history["direct_to_bs_packets"])),
         "wall_time_s": time.time() - start_time,
         "trajectory": history,
         "final_pareto_front": (

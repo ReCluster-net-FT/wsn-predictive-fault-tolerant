@@ -10,12 +10,14 @@ MOGA selection and TDMA traffic model.
 - Each run samples 100 sensors from the WSN CSV using its seed. The sink is
   placed at the mean sensor coordinates.
 - ns-3 uses a fixed Euclidean `RangePropagationLossModel`. Its range is the
-  maximum pairwise distance among all sensors and the sink, so every node and
-  every sensor pair is in range. RSSI is not used.
-- All live sensors are assigned to their nearest live CH. Members never send
-  directly to the sink. If a CH dies during a round, MOGA chooses a new CH set
-  after that round's CH-to-sink phase; surviving sensors are assigned to the
-  nearest selected CH in the next round. CHs may have no members.
+  maximum pairwise distance among all sensors and the sink (+1 m), so the
+  deployment is dense: every node reaches the BS and every possible CH.
+  RSSI is not used.
+- The GraphSAGE graph and the node degree use the separate neighbour range
+  `Network.communication_range` (13.95 m), not the radio range.
+- After every re-cluster the BS assigns each live sensor to its nearest CH and
+  fixes this assignment until the next re-cluster (see TDMA below). CHs may
+  have no members.
 
 ## MOGA
 
@@ -51,23 +53,44 @@ meaningful.
 
 ## TDMA and transmitted data
 
-Each round has two serialized TDMA phases. Slots are sized from payload length
-at 11 Mbps with a 2 ms guard interval:
+The BS assigns a two-level TDMA schedule after each re-cluster and keeps it
+for every round until the next re-cluster. Slots are sized from payload
+length at 11 Mbps with a 2 ms guard interval. Each round:
 
-1. Every cluster head schedules one slot for each of its members. Each member
-   sends a JSON UDP payload containing its CSV temperature and humidity,
-   current residual energy, and degree.
-2. Each CH has one slot to send an aggregate payload with those values for
-   itself and its assigned members directly to the sink.
+0. Only after a re-cluster: the BS broadcasts the schedule (CH slot order and
+   each CH's member slot order). Every live sensor receives it.
+1. Level 1, one frame per CH: the CH broadcasts a short beacon to its members,
+   then each member sends a JSON UDP payload to its CH in its own slot:
+   CSV temperature and humidity, current residual energy and degree. The
+   residual energy is the piggybacked network-state data.
+2. Level 2: each CH sends its aggregate (its own record and those of the
+   members it received) directly to the BS in its slot; there are no inter-CH
+   routes. The frame ends with emergency slots for orphaned members (below).
 
-CH-to-sink transmissions are direct; there are no inter-CH routes. After all
-CH slots, MOGA runs once to produce the next round's clustering. Nodes use
-zero idle and CCA radio current to model sleeping outside their TDMA slots;
-ns-3 accounts for transmission and reception energy.
+Only the scheduled sender and receivers of a slot pay radio energy; every
+other node sleeps (idle current only). Energy is debited slot by slot, so a
+node whose battery cannot cover a slot dies in that slot: it does not
+transmit, and packets addressed to it are lost.
 
-Degree is the count of other sensors within the configured radio range. Since
-the range is derived from the maximum pairwise distance, this deployment is
-fully connected and every sensor has degree `N - 1`.
+Degree is the count of other sensors within the 13.95 m neighbour range.
+
+## CH failure and re-cluster triggers
+
+A member whose CH sent no beacon (CH dead), or whose packet got no MAC ACK
+(CH died mid-frame), is orphaned. It sends its record directly to the BS in
+an emergency slot at the end of the round. The BS identifies senders by IPv4
+address; data from a node that is not a scheduled CH means a CH failed.
+
+After each round the BS re-clusters (MOGA, then a new schedule broadcast) when:
+
+1. `ch_failure`: it received data directly from a non-CH node;
+2. `no_live_ch`: no scheduled CH is alive;
+3. `predicted` (`--method predictive` only): XGBoost predicts `recluster`.
+   `watch` calls `handle_watch()` (placeholder) and `healthy` keeps the schedule.
+
+The `moga` and `graphsage` baselines re-cluster every round (`periodic`).
+Each round's reason is stored in `trajectory.recluster_reason` and the totals
+in `recluster_reasons`. Data lost while a re-cluster is computed is not modelled.
 
 ## Running
 
@@ -85,8 +108,8 @@ The script compares MOGA and MOGA+GraphSAGE over three seeds and 3,000 rounds.
 ## Scope and deviations
 
 This is a project-specific adaptation, not a literal reproduction of the
-paper. The paper's initial random clustering, 100-chromosome population,
-LSA route search, and sink-adjacent direct-member traffic are not used in this
-TDMA setup. The MOGA population and adaptation settings, Euclidean
+paper. The paper's initial random clustering, 100-chromosome population and
+LSA route search are not used in this TDMA setup; members reach the BS
+directly only after a CH failure. The MOGA population and adaptation settings, Euclidean
 communication range, TDMA slot timing, and ns-3 radio model are explicit
 implementation choices.
